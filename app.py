@@ -6,102 +6,214 @@ import re
 
 st.set_page_config(page_title="Outlet Splitter", layout="centered")
 st.title("🧩 Outlet Splitter & CSV Converter")
-st.caption("Upload any file → get Google-Sheets-ready CSVs + split by outlet")
+st.caption("Upload file(s) → get Google-Sheets-ready CSVs + split by outlet (rows / columns / sheets)")
 
-# ---------- Helpers ----------
+SUPPORTED_TYPES = ["csv", "tsv", "txt", "xlsx", "xls", "json"]
 
-def clean_columns(df):
+# ---------------- Helpers ----------------
+
+def clean_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
     df.columns = [str(c).strip() for c in df.columns]
+    # strip strings
+    for c in df.columns:
+        if df[c].dtype == object:
+            df[c] = df[c].apply(lambda x: x.strip() if isinstance(x, str) else x)
     return df
 
-def is_numeric_header(col):
+def safe_name(s: str) -> str:
+    s = str(s)
+    s = s.replace("/", "-").replace("\\", "-")
+    s = re.sub(r'[<>:"|?*]', "-", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:120] if s else "UNKNOWN"
+
+def to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+
+def is_numeric_header(col) -> bool:
     return bool(re.fullmatch(r"\d{5,}", str(col).strip()))
 
-def detect_outlet_row_column(df):
+def detect_outlet_columns(df: pd.DataFrame):
+    return [c for c in df.columns if is_numeric_header(c)]
+
+def detect_outlet_row_column(df: pd.DataFrame):
+    """
+    Finds a column that likely represents outlet/store/branch/site.
+    Prefers columns that repeat (unique ratio not too high).
+    """
     for c in df.columns:
-        lc = c.lower()
-        if any(k in lc for k in ["outlet", "store", "branch", "site"]):
-            if df[c].nunique(dropna=True) < len(df) * 0.3:
+        lc = str(c).lower()
+        if any(k in lc for k in ["outlet", "store", "branch", "site", "location"]):
+            nun = df[c].nunique(dropna=True)
+            if len(df) == 0:
+                continue
+            ratio = nun / max(1, len(df))
+            # outlet identifier should repeat across rows
+            if nun >= 2 and ratio < 0.4:
                 return c
     return None
 
-def detect_outlet_columns(df):
-    return [c for c in df.columns if is_numeric_header(c)]
+def read_any_file(uploaded):
+    name = uploaded.name.lower()
 
-def to_csv_bytes(df):
-    return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    if name.endswith(("xlsx", "xls")):
+        # Return dict of sheets
+        sheets = pd.read_excel(uploaded, sheet_name=None, dtype=object)
+        cleaned = {}
+        for sh, df in sheets.items():
+            if df is None or getattr(df, "empty", True):
+                continue
+            df = clean_df(df)
+            if not df.empty:
+                cleaned[str(sh).strip()] = df
+        return {"type": "excel", "sheets": cleaned}
 
-# ---------- Upload ----------
+    if name.endswith("json"):
+        df = pd.read_json(uploaded)
+        df = clean_df(df)
+        return {"type": "table", "df": df}
 
-uploaded = st.file_uploader(
-    "Upload file",
-    type=["csv", "tsv", "txt", "xlsx", "xls", "json"]
+    # csv/tsv/txt
+    if name.endswith("tsv"):
+        df = pd.read_csv(uploaded, sep="\t", dtype=object)
+    else:
+        df = pd.read_csv(uploaded, sep=",", dtype=object)
+
+    df = clean_df(df)
+    return {"type": "table", "df": df}
+
+# ---------------- UI ----------------
+
+uploaded_files = st.file_uploader(
+    "Upload file(s)",
+    type=SUPPORTED_TYPES,
+    accept_multiple_files=True
 )
 
-if uploaded:
-    # ---------- Read file ----------
-    if uploaded.name.endswith(("xlsx", "xls")):
-        df = pd.read_excel(uploaded, dtype=object)
-    elif uploaded.name.endswith("json"):
-        df = pd.read_json(uploaded)
-    else:
-        sep = "\t" if uploaded.name.endswith("tsv") else ","
-        df = pd.read_csv(uploaded, sep=sep, dtype=object)
+if uploaded_files:
+    big_zip = io.BytesIO()
 
-    df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
-    df = clean_columns(df)
+    with zipfile.ZipFile(big_zip, "w", zipfile.ZIP_DEFLATED) as z:
+        for uploaded in uploaded_files:
+            folder = safe_name(uploaded.name)
+            result = read_any_file(uploaded)
 
-    st.success(f"Loaded {len(df)} rows × {len(df.columns)} columns")
+            # ===========================
+            # CASE A: Excel with MULTIPLE SHEETS (each sheet = outlet)
+            # ===========================
+            if result["type"] == "excel":
+                sheets = result["sheets"]
 
-    # ---------- Detect structure ----------
-    outlet_row_col = detect_outlet_row_column(df)
-    outlet_cols = detect_outlet_columns(df)
+                if len(sheets) == 0:
+                    z.writestr(f"{folder}/ERROR.txt", "No readable data found in this Excel file.")
+                    continue
 
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as z:
+                if len(sheets) > 1:
+                    # combined = stack sheets with outlet_id = sheet name
+                    combined_frames = []
+                    for sh, df_sh in sheets.items():
+                        out = df_sh.copy()
+                        out.insert(0, "outlet_id", sh)
+                        out.insert(1, "_sheet", sh)
+                        combined_frames.append(out)
 
-        # ---------- CASE 1: Outlet as columns ----------
-        if outlet_cols:
-            base_cols = [c for c in df.columns if c not in outlet_cols]
+                        z.writestr(
+                            f"{folder}/outlet_{safe_name(sh)}.csv",
+                            to_csv_bytes(out)
+                        )
 
-            # Combined
-            z.writestr("combined.csv", to_csv_bytes(df))
+                    combined_df = pd.concat(combined_frames, ignore_index=True)
+                    z.writestr(f"{folder}/combined.csv", to_csv_bytes(combined_df))
 
-            # Long format
-            long_df = df.melt(
-                id_vars=base_cols,
-                value_vars=outlet_cols,
-                var_name="outlet_id",
-                value_name="outlet_value"
+                    # For sheet-based outlets, "long_format" is basically combined with outlet_id
+                    z.writestr(f"{folder}/long_format.csv", to_csv_bytes(combined_df))
+
+                    z.writestr(
+                        f"{folder}/INFO.txt",
+                        "Detected multiple sheets → treated each sheet as an outlet."
+                    )
+                    continue  # IMPORTANT: do not run row/column outlet detection
+
+                # If ONLY ONE sheet → fall back to normal detection
+                df = list(sheets.values())[0]
+
+            else:
+                df = result["df"]
+
+            if df is None or df.empty:
+                z.writestr(f"{folder}/ERROR.txt", "No readable rows found.")
+                continue
+
+            # ===========================
+            # CASE B: Outlet as COLUMNS (numeric outlet ids as headers)
+            # ===========================
+            outlet_cols = detect_outlet_columns(df)
+            if outlet_cols:
+                base_cols = [c for c in df.columns if c not in outlet_cols]
+
+                # combined
+                z.writestr(f"{folder}/combined.csv", to_csv_bytes(df))
+
+                # long
+                long_df = df.melt(
+                    id_vars=base_cols,
+                    value_vars=outlet_cols,
+                    var_name="outlet_id",
+                    value_name="outlet_value"
+                )
+                z.writestr(f"{folder}/long_format.csv", to_csv_bytes(long_df))
+
+                # per outlet
+                for oc in outlet_cols:
+                    out_df = df[base_cols + [oc]].copy()
+                    out_df.insert(0, "outlet_id", oc)
+                    out_df = out_df.rename(columns={oc: "outlet_value"})
+                    z.writestr(f"{folder}/outlet_{safe_name(oc)}.csv", to_csv_bytes(out_df))
+
+                z.writestr(
+                    f"{folder}/INFO.txt",
+                    "Detected outlets as COLUMNS (numeric outlet ids in headers)."
+                )
+                continue
+
+            # ===========================
+            # CASE C: Outlet as ROWS (a column like store/outlet/site/branch)
+            # ===========================
+            outlet_row_col = detect_outlet_row_column(df)
+            if outlet_row_col:
+                z.writestr(f"{folder}/combined.csv", to_csv_bytes(df))
+
+                # per outlet
+                for outlet, grp in df.groupby(outlet_row_col, dropna=False):
+                    grp = grp.copy()
+                    grp.insert(0, "outlet_id", outlet)
+                    z.writestr(f"{folder}/outlet_{safe_name(outlet)}.csv", to_csv_bytes(grp))
+
+                # long_format = combined with outlet_id column (same idea)
+                long_df = df.copy()
+                long_df.insert(0, "outlet_id", long_df[outlet_row_col])
+                z.writestr(f"{folder}/long_format.csv", to_csv_bytes(long_df))
+
+                z.writestr(
+                    f"{folder}/INFO.txt",
+                    f"Detected outlets as ROWS using column: {outlet_row_col}"
+                )
+                continue
+
+            # ===========================
+            # CASE D: No outlet detected
+            # ===========================
+            z.writestr(f"{folder}/combined.csv", to_csv_bytes(df))
+            z.writestr(
+                f"{folder}/INFO.txt",
+                "No outlet detected → exported combined.csv only."
             )
-            z.writestr("long_format.csv", to_csv_bytes(long_df))
 
-            # Per outlet
-            for oc in outlet_cols:
-                out_df = df[base_cols + [oc]].copy()
-                out_df.insert(0, "outlet_id", oc)
-                out_df = out_df.rename(columns={oc: "outlet_value"})
-                z.writestr(f"outlet_{oc}.csv", to_csv_bytes(out_df))
-
-            st.info("Detected outlets as COLUMNS")
-
-        # ---------- CASE 2: Outlet as rows ----------
-        elif outlet_row_col:
-            z.writestr("combined.csv", to_csv_bytes(df))
-
-            for outlet, grp in df.groupby(outlet_row_col):
-                name = str(outlet).replace("/", "-")
-                z.writestr(f"outlet_{name}.csv", to_csv_bytes(grp))
-
-            st.info(f"Detected outlet column: `{outlet_row_col}`")
-
-        else:
-            z.writestr("combined.csv", to_csv_bytes(df))
-            st.warning("No outlet detected — exported combined CSV only")
-
+    st.success("Processed files successfully ✅")
     st.download_button(
         "⬇️ Download results (ZIP)",
-        zip_buffer.getvalue(),
+        big_zip.getvalue(),
         file_name="outlet_outputs.zip",
         mime="application/zip"
     )
