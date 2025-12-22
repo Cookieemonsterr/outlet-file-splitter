@@ -54,11 +54,31 @@ def detect_outlet_row_column(df: pd.DataFrame):
                 return c
     return None
 
+# ✅ NEW: robust reader for CSV/TSV/TXT (fixes UnicodeDecodeError)
+def read_text_table_with_fallback(uploaded, sep: str) -> tuple[pd.DataFrame, str]:
+    """
+    Tries multiple encodings so the app doesn't crash on non-UTF8 CSV exports.
+    Returns: (df, encoding_used)
+    """
+    encodings_to_try = ["utf-8", "utf-8-sig", "cp1252", "latin1"]
+    last_err = None
+
+    for enc in encodings_to_try:
+        try:
+            uploaded.seek(0)  # IMPORTANT: reset pointer before each attempt
+            df = pd.read_csv(uploaded, sep=sep, dtype=object, encoding=enc)
+            return df, enc
+        except Exception as e:
+            last_err = e
+
+    raise last_err
+
 def read_any_file(uploaded):
     name = uploaded.name.lower()
 
     if name.endswith(("xlsx", "xls")):
         # Return dict of sheets
+        uploaded.seek(0)
         sheets = pd.read_excel(uploaded, sheet_name=None, dtype=object)
         cleaned = {}
         for sh, df in sheets.items():
@@ -70,18 +90,16 @@ def read_any_file(uploaded):
         return {"type": "excel", "sheets": cleaned}
 
     if name.endswith("json"):
+        uploaded.seek(0)
         df = pd.read_json(uploaded)
         df = clean_df(df)
         return {"type": "table", "df": df}
 
-    # csv/tsv/txt
-    if name.endswith("tsv"):
-        df = pd.read_csv(uploaded, sep="\t", dtype=object)
-    else:
-        df = pd.read_csv(uploaded, sep=",", dtype=object)
-
+    # csv/tsv/txt ✅ now uses fallback encodings
+    sep = "\t" if name.endswith("tsv") else ","
+    df, used_encoding = read_text_table_with_fallback(uploaded, sep=sep)
     df = clean_df(df)
-    return {"type": "table", "df": df}
+    return {"type": "table", "df": df, "encoding": used_encoding}
 
 # ---------------- UI ----------------
 
@@ -98,6 +116,10 @@ if uploaded_files:
         for uploaded in uploaded_files:
             folder = safe_name(uploaded.name)
             result = read_any_file(uploaded)
+
+            # Optional: record encoding used (only for csv/tsv/txt)
+            if result.get("encoding"):
+                z.writestr(f"{folder}/INFO_encoding.txt", f"Read using encoding: {result['encoding']}")
 
             # ===========================
             # CASE A: Excel with MULTIPLE SHEETS (each sheet = outlet)
