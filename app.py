@@ -37,35 +37,122 @@ def is_numeric_header(col) -> bool:
 def detect_outlet_columns(df: pd.DataFrame):
     return [c for c in df.columns if is_numeric_header(c)]
 
+# ✅ FIXED: prioritize Outlet ID over Site no + still supports site/store/branch/outlet
 def detect_outlet_row_column(df: pd.DataFrame):
     """
-    Finds a column that likely represents outlet/store/branch/site.
-    Prefers columns that repeat (unique ratio not too high).
+    Detect outlet column using priority patterns (Outlet ID first).
     """
-    for c in df.columns:
-        lc = str(c).lower()
-        if any(k in lc for k in ["outlet", "store", "branch", "site", "location"]):
-            nun = df[c].nunique(dropna=True)
-            if len(df) == 0:
-                continue
-            ratio = nun / max(1, len(df))
-            # outlet identifier should repeat across rows
-            if nun >= 2 and ratio < 0.4:
-                return c
+    priority_patterns = [
+        r"\boutlet\s*id\b",
+        r"\bstore\s*id\b",
+        r"\bbranch\s*id\b",
+        r"\boutlet\b",
+        r"\bbranch\b",
+        r"\bstore\b",
+        r"\bsite\s*no\b",
+        r"\bsite\b",
+        r"\blocation\b",
+    ]
+
+    cols = list(df.columns)
+    for pat in priority_patterns:
+        for c in cols:
+            lc = str(c).lower().strip()
+            if re.search(pat, lc):
+                series = df[c].dropna()
+                if series.empty:
+                    continue
+                nun = series.nunique()
+                ratio = nun / max(1, len(series))
+                # outlet identifier should repeat across rows
+                if nun >= 2 and ratio < 0.7:
+                    return c
     return None
 
-# ✅ NEW: robust reader for CSV/TSV/TXT (fixes UnicodeDecodeError)
+# ✅ NEW: smart fallback if headers are messy / shifted
+def detect_outlet_row_column_smart(df: pd.DataFrame):
+    """
+    Smart detection even if headers are weird or outlet column shifts A/B/C.
+    Priority:
+      1) header-based detection
+      2) behavior-based scan (repeating ID-like values)
+    """
+    col = detect_outlet_row_column(df)
+    if col:
+        return col
+
+    if df is None or df.empty:
+        return None
+
+    bad_keywords = ["upc", "barcode", "gtin", "sku", "item", "product", "price", "qty", "quantity", "stock", "name", "description", "plu"]
+    best = None  # (score, colname)
+
+    # scan first 20 columns (outlet identifiers are usually early)
+    for c in df.columns[:20]:
+        lc = str(c).lower().strip()
+
+        if any(k in lc for k in bad_keywords):
+            continue
+
+        series = df[c].dropna()
+        if series.empty:
+            continue
+
+        nun = series.nunique()
+        total = len(series)
+        ratio = nun / max(1, total)
+
+        if nun < 2:
+            continue
+        if ratio > 0.7:  # too unique, likely item/sku/name
+            continue
+
+        sample = series.astype(str).head(40)
+
+        # % that look like numeric IDs (3+ digits)
+        looks_id = sample.apply(lambda x: bool(re.fullmatch(r"\d{3,}", x.strip()))).mean()
+
+        # score: prefer repeating + ID-looking
+        score = (1 - ratio) * 3 + looks_id * 5
+
+        if best is None or score > best[0]:
+            best = (score, c)
+
+    return best[1] if best else None
+
+# ✅ NEW: if both Site no + Outlet ID exist, combine them to avoid collisions
+def apply_combined_outlet_key_if_possible(df: pd.DataFrame):
+    """
+    If both 'Site no' and 'Outlet ID' exist, create _outlet_key = 'Site no - Outlet ID'
+    and return (df, '_outlet_key'). Otherwise return (df, None).
+    """
+    def norm(s): return str(s).lower().strip()
+
+    site_col = None
+    outletid_col = None
+
+    for c in df.columns:
+        lc = norm(c)
+        if site_col is None and re.search(r"\bsite\s*no\b", lc):
+            site_col = c
+        if outletid_col is None and re.search(r"\boutlet\s*id\b", lc):
+            outletid_col = c
+
+    if site_col and outletid_col:
+        df2 = df.copy()
+        df2["_outlet_key"] = df2[site_col].astype(str).fillna("UNKNOWN") + " - " + df2[outletid_col].astype(str).fillna("UNKNOWN")
+        return df2, "_outlet_key"
+
+    return df, None
+
+# ✅ robust reader for CSV/TSV/TXT (fixes UnicodeDecodeError)
 def read_text_table_with_fallback(uploaded, sep: str) -> tuple[pd.DataFrame, str]:
-    """
-    Tries multiple encodings so the app doesn't crash on non-UTF8 CSV exports.
-    Returns: (df, encoding_used)
-    """
     encodings_to_try = ["utf-8", "utf-8-sig", "cp1252", "latin1"]
     last_err = None
 
     for enc in encodings_to_try:
         try:
-            uploaded.seek(0)  # IMPORTANT: reset pointer before each attempt
+            uploaded.seek(0)
             df = pd.read_csv(uploaded, sep=sep, dtype=object, encoding=enc)
             return df, enc
         except Exception as e:
@@ -77,7 +164,6 @@ def read_any_file(uploaded):
     name = uploaded.name.lower()
 
     if name.endswith(("xlsx", "xls")):
-        # Return dict of sheets
         uploaded.seek(0)
         sheets = pd.read_excel(uploaded, sheet_name=None, dtype=object)
         cleaned = {}
@@ -95,7 +181,6 @@ def read_any_file(uploaded):
         df = clean_df(df)
         return {"type": "table", "df": df}
 
-    # csv/tsv/txt ✅ now uses fallback encodings
     sep = "\t" if name.endswith("tsv") else ","
     df, used_encoding = read_text_table_with_fallback(uploaded, sep=sep)
     df = clean_df(df)
@@ -117,7 +202,7 @@ if uploaded_files:
             folder = safe_name(uploaded.name)
             result = read_any_file(uploaded)
 
-            # Optional: record encoding used (only for csv/tsv/txt)
+            # record encoding used (only for csv/tsv/txt)
             if result.get("encoding"):
                 z.writestr(f"{folder}/INFO_encoding.txt", f"Read using encoding: {result['encoding']}")
 
@@ -132,7 +217,6 @@ if uploaded_files:
                     continue
 
                 if len(sheets) > 1:
-                    # combined = stack sheets with outlet_id = sheet name
                     combined_frames = []
                     for sh, df_sh in sheets.items():
                         out = df_sh.copy()
@@ -147,19 +231,15 @@ if uploaded_files:
 
                     combined_df = pd.concat(combined_frames, ignore_index=True)
                     z.writestr(f"{folder}/combined.csv", to_csv_bytes(combined_df))
-
-                    # For sheet-based outlets, "long_format" is basically combined with outlet_id
                     z.writestr(f"{folder}/long_format.csv", to_csv_bytes(combined_df))
 
                     z.writestr(
                         f"{folder}/INFO.txt",
                         "Detected multiple sheets → treated each sheet as an outlet."
                     )
-                    continue  # IMPORTANT: do not run row/column outlet detection
+                    continue
 
-                # If ONLY ONE sheet → fall back to normal detection
                 df = list(sheets.values())[0]
-
             else:
                 df = result["df"]
 
@@ -174,10 +254,8 @@ if uploaded_files:
             if outlet_cols:
                 base_cols = [c for c in df.columns if c not in outlet_cols]
 
-                # combined
                 z.writestr(f"{folder}/combined.csv", to_csv_bytes(df))
 
-                # long
                 long_df = df.melt(
                     id_vars=base_cols,
                     value_vars=outlet_cols,
@@ -186,7 +264,6 @@ if uploaded_files:
                 )
                 z.writestr(f"{folder}/long_format.csv", to_csv_bytes(long_df))
 
-                # per outlet
                 for oc in outlet_cols:
                     out_df = df[base_cols + [oc]].copy()
                     out_df.insert(0, "outlet_id", oc)
@@ -200,19 +277,26 @@ if uploaded_files:
                 continue
 
             # ===========================
-            # CASE C: Outlet as ROWS (a column like store/outlet/site/branch)
+            # CASE C: Outlet as ROWS (smart detection)
             # ===========================
-            outlet_row_col = detect_outlet_row_column(df)
+            # Prefer a combined key if both exist (Site no + Outlet ID)
+            df2, combined_key = apply_combined_outlet_key_if_possible(df)
+            if combined_key:
+                outlet_row_col = combined_key
+                df = df2
+                z.writestr(f"{folder}/INFO_outlet_key.txt", "Using combined outlet key: Site no - Outlet ID")
+            else:
+                outlet_row_col = detect_outlet_row_column_smart(df)
+
             if outlet_row_col:
                 z.writestr(f"{folder}/combined.csv", to_csv_bytes(df))
+                z.writestr(f"{folder}/INFO_outlet_column.txt", f"Outlet column detected: {outlet_row_col}")
 
-                # per outlet
                 for outlet, grp in df.groupby(outlet_row_col, dropna=False):
                     grp = grp.copy()
                     grp.insert(0, "outlet_id", outlet)
                     z.writestr(f"{folder}/outlet_{safe_name(outlet)}.csv", to_csv_bytes(grp))
 
-                # long_format = combined with outlet_id column (same idea)
                 long_df = df.copy()
                 long_df.insert(0, "outlet_id", long_df[outlet_row_col])
                 z.writestr(f"{folder}/long_format.csv", to_csv_bytes(long_df))
