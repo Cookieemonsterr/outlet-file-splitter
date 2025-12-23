@@ -15,7 +15,6 @@ SUPPORTED_TYPES = ["csv", "tsv", "txt", "xlsx", "xls", "json"]
 def clean_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
     df.columns = [str(c).strip() for c in df.columns]
-    # strip strings
     for c in df.columns:
         if df[c].dtype == object:
             df[c] = df[c].apply(lambda x: x.strip() if isinstance(x, str) else x)
@@ -37,11 +36,7 @@ def is_numeric_header(col) -> bool:
 def detect_outlet_columns(df: pd.DataFrame):
     return [c for c in df.columns if is_numeric_header(c)]
 
-# ✅ FIXED: prioritize Outlet ID over Site no + still supports site/store/branch/outlet
 def detect_outlet_row_column(df: pd.DataFrame):
-    """
-    Detect outlet column using priority patterns (Outlet ID first).
-    """
     priority_patterns = [
         r"\boutlet\s*id\b",
         r"\bstore\s*id\b",
@@ -68,11 +63,7 @@ def detect_outlet_row_column(df: pd.DataFrame):
                     return c
     return None
 
-# ✅ NEW: smart fallback if headers are messy / shifted
 def detect_outlet_row_column_smart(df: pd.DataFrame):
-    """
-    Smart detection even if headers are weird or outlet column shifts A/B/C.
-    """
     col = detect_outlet_row_column(df)
     if col:
         return col
@@ -82,7 +73,7 @@ def detect_outlet_row_column_smart(df: pd.DataFrame):
 
     bad_keywords = ["upc", "barcode", "gtin", "sku", "item", "product", "price", "qty",
                     "quantity", "stock", "name", "description", "plu"]
-    best = None  # (score, colname)
+    best = None
 
     for c in df.columns[:20]:
         lc = str(c).lower().strip()
@@ -111,12 +102,7 @@ def detect_outlet_row_column_smart(df: pd.DataFrame):
 
     return best[1] if best else None
 
-# ✅ NEW: if both Site no + Outlet ID exist, combine them to avoid collisions
 def apply_combined_outlet_key_if_possible(df: pd.DataFrame):
-    """
-    If both 'Site no' and 'Outlet ID' exist, create _outlet_key = 'Site no - Outlet ID'
-    and return (df, '_outlet_key'). Otherwise return (df, None).
-    """
     def norm(s): return str(s).lower().strip()
 
     site_col = None
@@ -139,7 +125,6 @@ def apply_combined_outlet_key_if_possible(df: pd.DataFrame):
 
     return df, None
 
-# ✅ robust reader for CSV/TSV/TXT (fixes UnicodeDecodeError)
 def read_text_table_with_fallback(uploaded, sep: str) -> tuple[pd.DataFrame, str]:
     encodings_to_try = ["utf-8", "utf-8-sig", "cp1252", "latin1"]
     last_err = None
@@ -154,7 +139,7 @@ def read_text_table_with_fallback(uploaded, sep: str) -> tuple[pd.DataFrame, str
 
     raise last_err
 
-# ---------------- NEW: Excel header-row auto detection ----------------
+# ---------------- Excel header-row auto detection ----------------
 
 HEADER_TOKENS = [
     "upc", "barcode", "gtin", "sku",
@@ -165,10 +150,6 @@ HEADER_TOKENS = [
 ]
 
 def detect_header_row_from_preview(preview_df: pd.DataFrame, max_rows: int = 30) -> int:
-    """
-    Given a header=None dataframe, find the row that looks most like a header
-    by counting how many cells contain known header tokens.
-    """
     best_row = 0
     best_hits = -1
 
@@ -183,16 +164,14 @@ def detect_header_row_from_preview(preview_df: pd.DataFrame, max_rows: int = 30)
 
     return best_row
 
-def read_excel_sheet_smart(uploaded, sheet_name: str):
-    """
-    Reads an Excel sheet even if there are title rows/merged headers above the real header.
-    """
-    uploaded.seek(0)
-    preview = pd.read_excel(uploaded, sheet_name=sheet_name, header=None, nrows=40, dtype=object)
+# ✅ NEW: Always read Excel from BytesIO + force engine fallback
+def read_excel_sheet_smart_from_bytes(excel_bytes: io.BytesIO, sheet_name: str, engine: str):
+    excel_bytes.seek(0)
+    preview = pd.read_excel(excel_bytes, sheet_name=sheet_name, header=None, nrows=40, dtype=object, engine=engine)
     header_row = detect_header_row_from_preview(preview, max_rows=30)
 
-    uploaded.seek(0)
-    df = pd.read_excel(uploaded, sheet_name=sheet_name, header=header_row, dtype=object)
+    excel_bytes.seek(0)
+    df = pd.read_excel(excel_bytes, sheet_name=sheet_name, header=header_row, dtype=object, engine=engine)
     df = clean_df(df)
     return df, header_row
 
@@ -200,20 +179,35 @@ def read_any_file(uploaded):
     name = uploaded.name.lower()
 
     if name.endswith(("xlsx", "xls")):
-        uploaded.seek(0)
-        xls = pd.ExcelFile(uploaded)
+        # ✅ key fix: work from bytes
+        excel_bytes = io.BytesIO(uploaded.getvalue())
 
-        cleaned = {}
-        header_rows = {}
+        # try engines in order (xlsx usually openpyxl, xls usually xlrd)
+        engines_to_try = ["openpyxl", "xlrd"]
+        last_err = None
 
-        for sh in xls.sheet_names:
-            df_sh, header_row = read_excel_sheet_smart(uploaded, sh)
-            if df_sh is None or df_sh.empty:
-                continue
-            cleaned[str(sh).strip()] = df_sh
-            header_rows[str(sh).strip()] = header_row
+        for engine in engines_to_try:
+            try:
+                excel_bytes.seek(0)
+                xls = pd.ExcelFile(excel_bytes, engine=engine)
 
-        return {"type": "excel", "sheets": cleaned, "header_rows": header_rows}
+                cleaned = {}
+                header_rows = {}
+
+                for sh in xls.sheet_names:
+                    df_sh, header_row = read_excel_sheet_smart_from_bytes(excel_bytes, sh, engine=engine)
+                    if df_sh is None or df_sh.empty:
+                        continue
+                    cleaned[str(sh).strip()] = df_sh
+                    header_rows[str(sh).strip()] = header_row
+
+                return {"type": "excel", "sheets": cleaned, "header_rows": header_rows, "excel_engine": engine}
+
+            except Exception as e:
+                last_err = e
+
+        # if nothing worked, raise the last error
+        raise last_err
 
     if name.endswith("json"):
         uploaded.seek(0)
@@ -240,16 +234,25 @@ if uploaded_files:
     with zipfile.ZipFile(big_zip, "w", zipfile.ZIP_DEFLATED) as z:
         for uploaded in uploaded_files:
             folder = safe_name(uploaded.name)
-            result = read_any_file(uploaded)
+
+            # ✅ NEW: don’t let one file crash the whole app
+            try:
+                result = read_any_file(uploaded)
+            except Exception as e:
+                z.writestr(f"{folder}/ERROR.txt", f"Failed to read file: {uploaded.name}\n\n{repr(e)}")
+                continue
 
             # record encoding used (only for csv/tsv/txt)
             if result.get("encoding"):
                 z.writestr(f"{folder}/INFO_encoding.txt", f"Read using encoding: {result['encoding']}")
 
-            # record excel header row detection (helps debug weird templates)
-            if result.get("type") == "excel" and result.get("header_rows"):
-                rows_info = "\n".join([f"{sh}: header_row={hr}" for sh, hr in result["header_rows"].items()])
-                z.writestr(f"{folder}/INFO_excel_header_rows.txt", rows_info)
+            # record excel header row detection + engine
+            if result.get("type") == "excel":
+                if result.get("excel_engine"):
+                    z.writestr(f"{folder}/INFO_excel_engine.txt", f"Excel engine used: {result['excel_engine']}")
+                if result.get("header_rows"):
+                    rows_info = "\n".join([f"{sh}: header_row={hr}" for sh, hr in result["header_rows"].items()])
+                    z.writestr(f"{folder}/INFO_excel_header_rows.txt", rows_info)
 
             # ===========================
             # CASE A: Excel with MULTIPLE SHEETS (each sheet = outlet)
@@ -294,7 +297,6 @@ if uploaded_files:
 
             # ===========================
             # CASE B: Outlet as COLUMNS (numeric outlet ids as headers)
-            # ✅ This now works for your screenshot format because Excel header row is detected correctly
             # ===========================
             outlet_cols = detect_outlet_columns(df)
             if outlet_cols:
