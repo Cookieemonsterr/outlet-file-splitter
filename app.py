@@ -79,13 +79,26 @@ def normalize_numeric_like_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def clean_df(df: pd.DataFrame) -> pd.DataFrame:
     """Minimal cleaning - only removes empty rows/cols and cleans Price column"""
-    df = df.dropna(axis=0, how='all').dropna(axis=1, how='all')
+    # DON'T drop rows - keep everything
+    df = df.dropna(axis=1, how='all')  # Only drop completely empty columns
     
-    # Only clean column names minimally (remove control chars but keep everything else)
-    df.columns = [
-        re.sub(r'[\x00-\x1f\u2000-\u200f\u2028\u2029]+', '', str(c)).strip()
-        for c in df.columns
-    ]
+    # Aggressively clean column names (including Price header)
+    cleaned_cols = []
+    for c in df.columns:
+        col_str = str(c)
+        # Keep only safe ASCII characters in column names
+        safe_chars = []
+        for char in col_str:
+            code = ord(char)
+            if 32 <= code <= 126:  # Standard ASCII printable
+                safe_chars.append(char)
+            elif char in [' ', '\t']:
+                safe_chars.append(' ')
+        cleaned = ''.join(safe_chars).strip()
+        cleaned = ' '.join(cleaned.split())  # Normalize spaces
+        cleaned_cols.append(cleaned if cleaned else 'Unnamed')
+    
+    df.columns = cleaned_cols
     
     # Trim whitespace from string cells (but don't change content)
     for c in df.columns:
