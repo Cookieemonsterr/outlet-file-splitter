@@ -12,18 +12,71 @@ SUPPORTED_TYPES = ["csv", "tsv", "txt", "xlsx", "xls", "json"]
 
 # ---------------- Helpers ----------------
 
+def normalize_numeric_like_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fixes cases where numeric fields (esp. Price) contain hidden junk chars from UTF-16 exports.
+    Extracts the first valid number token and removes invisible/control characters.
+    Keeps the result as clean numeric text (Sheets will read it as a number).
+    """
+
+    def extract_number_token(x):
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return x
+        s = str(x)
+
+        # remove nulls/control chars + common weird unicode control ranges
+        s = re.sub(r"[\x00-\x1f\u2000-\u200f\u2028\u2029]", "", s).strip()
+        if not s:
+            return ""
+
+        # find first number like 41 or 41.00 or 41,00
+        m = re.search(r"[-+]?\d+(?:[.,]\d+)?", s)
+        if not m:
+            return s  # if not numeric-like, keep as-is
+
+        token = m.group(0).replace(",", ".")
+        return token
+
+    # 1) Columns explicitly named like price/cost/etc.
+    key_cols = []
+    for c in df.columns:
+        lc = str(c).lower().strip()
+        if any(k in lc for k in ["price", "cost", "amount", "value", "rate", "rsp"]):
+            key_cols.append(c)
+
+    # 2) Also include columns where most values look numeric-ish (optional safety net)
+    for c in df.columns:
+        if c in key_cols:
+            continue
+        s = df[c].dropna().astype(str).head(60)
+        if len(s) == 0:
+            continue
+        hit = s.str.contains(r"\d", regex=True).mean()
+        if hit >= 0.9:
+            key_cols.append(c)
+
+    for c in key_cols:
+        if c in df.columns:
+            df[c] = df[c].apply(extract_number_token)
+
+    return df
+
 def clean_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
 
-    # remove invisible junk chars that show up in weird exports
+    # remove invisible junk chars that show up in weird exports (column names)
     df.columns = [
         re.sub(r"[\x00-\x1f\u2000-\u200f\u2028\u2029]+", "", str(c)).strip()
         for c in df.columns
     ]
 
+    # trim cell strings
     for c in df.columns:
         if df[c].dtype == object:
             df[c] = df[c].apply(lambda x: x.strip() if isinstance(x, str) else x)
+
+    # ✅ FIX: clean numeric-like columns (esp. Price) to remove hidden gibberish
+    df = normalize_numeric_like_columns(df)
 
     return df
 
