@@ -3,7 +3,6 @@ import pandas as pd
 import zipfile
 import io
 import re
-import unicodedata
 
 st.set_page_config(page_title="Outlet Splitter", layout="centered")
 st.title("🧩 Outlet Splitter & CSV Converter")
@@ -13,47 +12,42 @@ SUPPORTED_TYPES = ["csv", "tsv", "txt", "xlsx", "xls", "json"]
 
 # ---------------- Helpers ----------------
 
-def deep_clean_text(text):
+def clean_price_column_only(text):
     """
-    ULTRA aggressive cleaning - keeps ONLY safe ASCII-like characters.
-    Removes ALL unicode junk that causes display issues in Google Sheets.
+    ULTRA aggressive cleaning ONLY for price/numeric columns.
+    Keeps ONLY safe ASCII characters to remove unicode junk.
     """
     if text is None or (isinstance(text, float) and pd.isna(text)):
         return text
     
     s = str(text)
     
-    # STEP 1: Keep only safe printable characters + common symbols
-    # This whitelist approach is more reliable than blacklisting unicode ranges
+    # Keep only safe printable ASCII characters
     safe_chars = []
     for char in s:
         code = ord(char)
-        # Keep: basic ASCII letters, numbers, common punctuation, spaces
-        # ASCII 32-126 is the safe printable range
         if 32 <= code <= 126:  # Standard ASCII printable
             safe_chars.append(char)
-        elif char in ['\n', '\r', '\t']:  # Keep basic whitespace
+        elif char in ['\n', '\r', '\t']:
             safe_chars.append(' ')
-        # Skip everything else (all the weird unicode)
     
     s = ''.join(safe_chars)
-    
-    # STEP 2: Clean up multiple spaces
     s = ' '.join(s.split())
     
     return s.strip()
 
 def normalize_numeric_like_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Fixes numeric fields (esp. Price) containing hidden junk chars.
-    Extracts the first valid number and removes ALL invisible characters.
+    Fixes ONLY numeric/price fields containing hidden junk chars.
+    Extracts clean numbers and removes ALL invisible characters.
+    Does NOT touch other columns.
     """
     def extract_clean_number(x):
         if x is None or (isinstance(x, float) and pd.isna(x)):
             return x
         
-        # First apply deep cleaning
-        s = deep_clean_text(x)
+        # First apply aggressive cleaning for price fields
+        s = clean_price_column_only(x)
         
         if not s:
             return ""
@@ -66,43 +60,39 @@ def normalize_numeric_like_columns(df: pd.DataFrame) -> pd.DataFrame:
         token = m.group(0).replace(',', '.')
         return token
     
-    # Find price/numeric columns
+    # Find ONLY price/cost/amount columns (be very specific)
     key_cols = []
     for c in df.columns:
         lc = str(c).lower().strip()
+        # Only match columns explicitly named with price/cost keywords
         if any(k in lc for k in ["price", "cost", "amount", "value", "rate", "rsp"]):
             key_cols.append(c)
     
-    # Also find columns with mostly numeric content
-    for c in df.columns:
-        if c in key_cols:
-            continue
-        s = df[c].dropna().astype(str).head(60)
-        if len(s) == 0:
-            continue
-        hit = s.str.contains(r'\d', regex=True).mean()
-        if hit >= 0.9:
-            key_cols.append(c)
-    
+    # Apply cleaning ONLY to identified price columns
     for c in key_cols:
         if c in df.columns:
             df[c] = df[c].apply(extract_clean_number)
     
     return df
+    
+    return df
 
 def clean_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Enhanced cleaning with aggressive character removal"""
+    """Minimal cleaning - only removes empty rows/cols and cleans Price column"""
     df = df.dropna(axis=0, how='all').dropna(axis=1, how='all')
     
-    # Clean column names aggressively
-    df.columns = [deep_clean_text(str(c)) for c in df.columns]
+    # Only clean column names minimally (remove control chars but keep everything else)
+    df.columns = [
+        re.sub(r'[\x00-\x1f\u2000-\u200f\u2028\u2029]+', '', str(c)).strip()
+        for c in df.columns
+    ]
     
-    # Clean all string cells
+    # Trim whitespace from string cells (but don't change content)
     for c in df.columns:
         if df[c].dtype == object:
-            df[c] = df[c].apply(lambda x: deep_clean_text(x) if isinstance(x, str) else x)
+            df[c] = df[c].apply(lambda x: x.strip() if isinstance(x, str) else x)
     
-    # Fix numeric columns
+    # Fix ONLY numeric/price columns (leaves all other data untouched)
     df = normalize_numeric_like_columns(df)
     
     return df
