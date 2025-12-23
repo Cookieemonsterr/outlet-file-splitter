@@ -164,7 +164,6 @@ def detect_header_row_from_preview(preview_df: pd.DataFrame, max_rows: int = 30)
 
     return best_row
 
-# ✅ NEW: Always read Excel from BytesIO + force engine fallback
 def read_excel_sheet_smart_from_bytes(excel_bytes: io.BytesIO, sheet_name: str, engine: str):
     excel_bytes.seek(0)
     preview = pd.read_excel(excel_bytes, sheet_name=sheet_name, header=None, nrows=40, dtype=object, engine=engine)
@@ -175,14 +174,23 @@ def read_excel_sheet_smart_from_bytes(excel_bytes: io.BytesIO, sheet_name: str, 
     df = clean_df(df)
     return df, header_row
 
+# ✅ NEW: detect if a file is likely UTF-16 text pretending to be XLS
+def looks_like_utf16_text(sample: bytes) -> bool:
+    # BOM OR lots of NUL bytes OR pattern like b'S\x00K\x00U\x00'
+    if sample.startswith(b"\xff\xfe") or sample.startswith(b"\xfe\xff"):
+        return True
+    if b"\x00" in sample:
+        return True
+    return False
+
 def read_any_file(uploaded):
     name = uploaded.name.lower()
 
+    # ---------------- Excel branch (xlsx/xls) ----------------
     if name.endswith(("xlsx", "xls")):
-        # ✅ key fix: work from bytes
         excel_bytes = io.BytesIO(uploaded.getvalue())
 
-        # try engines in order (xlsx usually openpyxl, xls usually xlrd)
+        # 1) Try real Excel engines first (same as before)
         engines_to_try = ["openpyxl", "xlrd"]
         last_err = None
 
@@ -206,15 +214,48 @@ def read_any_file(uploaded):
             except Exception as e:
                 last_err = e
 
-        # if nothing worked, raise the last error
+        # 2) ✅ NEW fallback: some ".XLS" are actually UTF-16 TSV/CSV text exports
+        # This ONLY runs if Excel engines failed, so it won't affect real Excels.
+        try:
+            excel_bytes.seek(0)
+            sample = excel_bytes.read(2000)
+
+            if looks_like_utf16_text(sample):
+                # Most common: UTF-16 TSV (SKU\t...)
+                for sep in ["\t", ","]:
+                    for enc in ["utf-16", "utf-16-le", "utf-16-be"]:
+                        try:
+                            excel_bytes.seek(0)
+                            df = pd.read_csv(excel_bytes, sep=sep, dtype=object, encoding=enc)
+                            df = clean_df(df)
+                            return {"type": "table", "df": df, "encoding": enc, "note": "XLS was actually UTF-16 text"}
+                        except Exception:
+                            pass
+
+            # If not clearly UTF-16, still try normal text fallbacks
+            for sep in ["\t", ","]:
+                try:
+                    excel_bytes.seek(0)
+                    df, used_enc = read_text_table_with_fallback(excel_bytes, sep=sep)
+                    df = clean_df(df)
+                    return {"type": "table", "df": df, "encoding": used_enc, "note": "XLS was actually text"}
+                except Exception:
+                    pass
+
+        except Exception:
+            pass
+
+        # If everything failed, raise the original Excel error
         raise last_err
 
+    # ---------------- JSON branch ----------------
     if name.endswith("json"):
         uploaded.seek(0)
         df = pd.read_json(uploaded)
         df = clean_df(df)
         return {"type": "table", "df": df}
 
+    # ---------------- CSV/TSV/TXT branch ----------------
     sep = "\t" if name.endswith("tsv") else ","
     df, used_encoding = read_text_table_with_fallback(uploaded, sep=sep)
     df = clean_df(df)
@@ -235,16 +276,19 @@ if uploaded_files:
         for uploaded in uploaded_files:
             folder = safe_name(uploaded.name)
 
-            # ✅ NEW: don’t let one file crash the whole app
+            # don’t let one file crash the whole app
             try:
                 result = read_any_file(uploaded)
             except Exception as e:
                 z.writestr(f"{folder}/ERROR.txt", f"Failed to read file: {uploaded.name}\n\n{repr(e)}")
                 continue
 
-            # record encoding used (only for csv/tsv/txt)
+            # record encoding used (csv/tsv/txt OR fake-xls-text)
             if result.get("encoding"):
                 z.writestr(f"{folder}/INFO_encoding.txt", f"Read using encoding: {result['encoding']}")
+
+            if result.get("note"):
+                z.writestr(f"{folder}/INFO_note.txt", result["note"])
 
             # record excel header row detection + engine
             if result.get("type") == "excel":
