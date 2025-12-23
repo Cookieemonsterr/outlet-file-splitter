@@ -15,36 +15,30 @@ SUPPORTED_TYPES = ["csv", "tsv", "txt", "xlsx", "xls", "json"]
 
 def deep_clean_text(text):
     """
-    Aggressively removes ALL problematic unicode characters, control chars, 
-    invisible chars, RTL marks, zero-width chars, and non-printable junk.
+    ULTRA aggressive cleaning - keeps ONLY safe ASCII-like characters.
+    Removes ALL unicode junk that causes display issues in Google Sheets.
     """
     if text is None or (isinstance(text, float) and pd.isna(text)):
         return text
     
     s = str(text)
     
-    # Remove NULL bytes and basic control chars
-    s = re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f-\x9f]', '', s)
+    # STEP 1: Keep only safe printable characters + common symbols
+    # This whitelist approach is more reliable than blacklisting unicode ranges
+    safe_chars = []
+    for char in s:
+        code = ord(char)
+        # Keep: basic ASCII letters, numbers, common punctuation, spaces
+        # ASCII 32-126 is the safe printable range
+        if 32 <= code <= 126:  # Standard ASCII printable
+            safe_chars.append(char)
+        elif char in ['\n', '\r', '\t']:  # Keep basic whitespace
+            safe_chars.append(' ')
+        # Skip everything else (all the weird unicode)
     
-    # Remove common invisible/formatting unicode ranges
-    s = re.sub(r'[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]', '', s)
+    s = ''.join(safe_chars)
     
-    # Remove directional marks (RTL/LTR)
-    s = re.sub(r'[\u061c\u200e\u200f\u202a-\u202e]', '', s)
-    
-    # Remove variation selectors
-    s = re.sub(r'[\ufe00-\ufe0f]', '', s)
-    
-    # Remove other common junk unicode blocks
-    s = re.sub(r'[\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]', ' ', s)
-    
-    # Normalize unicode (decompose then recompose)
-    s = unicodedata.normalize('NFKC', s)
-    
-    # Remove any remaining non-printable characters (keep basic punctuation)
-    s = ''.join(char for char in s if unicodedata.category(char)[0] not in ['C', 'M'] or char in ['\n', '\r', '\t', ' '])
-    
-    # Clean up whitespace
+    # STEP 2: Clean up multiple spaces
     s = ' '.join(s.split())
     
     return s.strip()
