@@ -64,7 +64,6 @@ def detect_outlet_row_column(df: pd.DataFrame):
                     continue
                 nun = series.nunique()
                 ratio = nun / max(1, len(series))
-                # outlet identifier should repeat across rows
                 if nun >= 2 and ratio < 0.7:
                     return c
     return None
@@ -73,9 +72,6 @@ def detect_outlet_row_column(df: pd.DataFrame):
 def detect_outlet_row_column_smart(df: pd.DataFrame):
     """
     Smart detection even if headers are weird or outlet column shifts A/B/C.
-    Priority:
-      1) header-based detection
-      2) behavior-based scan (repeating ID-like values)
     """
     col = detect_outlet_row_column(df)
     if col:
@@ -84,13 +80,12 @@ def detect_outlet_row_column_smart(df: pd.DataFrame):
     if df is None or df.empty:
         return None
 
-    bad_keywords = ["upc", "barcode", "gtin", "sku", "item", "product", "price", "qty", "quantity", "stock", "name", "description", "plu"]
+    bad_keywords = ["upc", "barcode", "gtin", "sku", "item", "product", "price", "qty",
+                    "quantity", "stock", "name", "description", "plu"]
     best = None  # (score, colname)
 
-    # scan first 20 columns (outlet identifiers are usually early)
     for c in df.columns[:20]:
         lc = str(c).lower().strip()
-
         if any(k in lc for k in bad_keywords):
             continue
 
@@ -104,15 +99,11 @@ def detect_outlet_row_column_smart(df: pd.DataFrame):
 
         if nun < 2:
             continue
-        if ratio > 0.7:  # too unique, likely item/sku/name
+        if ratio > 0.7:
             continue
 
         sample = series.astype(str).head(40)
-
-        # % that look like numeric IDs (3+ digits)
         looks_id = sample.apply(lambda x: bool(re.fullmatch(r"\d{3,}", x.strip()))).mean()
-
-        # score: prefer repeating + ID-looking
         score = (1 - ratio) * 3 + looks_id * 5
 
         if best is None or score > best[0]:
@@ -140,7 +131,10 @@ def apply_combined_outlet_key_if_possible(df: pd.DataFrame):
 
     if site_col and outletid_col:
         df2 = df.copy()
-        df2["_outlet_key"] = df2[site_col].astype(str).fillna("UNKNOWN") + " - " + df2[outletid_col].astype(str).fillna("UNKNOWN")
+        df2["_outlet_key"] = (
+            df2[site_col].astype(str).fillna("UNKNOWN") + " - " +
+            df2[outletid_col].astype(str).fillna("UNKNOWN")
+        )
         return df2, "_outlet_key"
 
     return df, None
@@ -160,20 +154,66 @@ def read_text_table_with_fallback(uploaded, sep: str) -> tuple[pd.DataFrame, str
 
     raise last_err
 
+# ---------------- NEW: Excel header-row auto detection ----------------
+
+HEADER_TOKENS = [
+    "upc", "barcode", "gtin", "sku",
+    "category", "sub_category", "subcategory",
+    "item", "product", "name", "description",
+    "price", "rsp", "stock", "qty", "quantity",
+    "outlet", "store", "branch", "site", "plu"
+]
+
+def detect_header_row_from_preview(preview_df: pd.DataFrame, max_rows: int = 30) -> int:
+    """
+    Given a header=None dataframe, find the row that looks most like a header
+    by counting how many cells contain known header tokens.
+    """
+    best_row = 0
+    best_hits = -1
+
+    rows_to_check = min(max_rows, len(preview_df))
+    for r in range(rows_to_check):
+        row = preview_df.iloc[r].tolist()
+        cells = [str(x).strip().lower() for x in row if pd.notna(x)]
+        hits = sum(1 for c in cells if any(t in c for t in HEADER_TOKENS))
+        if hits > best_hits:
+            best_hits = hits
+            best_row = r
+
+    return best_row
+
+def read_excel_sheet_smart(uploaded, sheet_name: str):
+    """
+    Reads an Excel sheet even if there are title rows/merged headers above the real header.
+    """
+    uploaded.seek(0)
+    preview = pd.read_excel(uploaded, sheet_name=sheet_name, header=None, nrows=40, dtype=object)
+    header_row = detect_header_row_from_preview(preview, max_rows=30)
+
+    uploaded.seek(0)
+    df = pd.read_excel(uploaded, sheet_name=sheet_name, header=header_row, dtype=object)
+    df = clean_df(df)
+    return df, header_row
+
 def read_any_file(uploaded):
     name = uploaded.name.lower()
 
     if name.endswith(("xlsx", "xls")):
         uploaded.seek(0)
-        sheets = pd.read_excel(uploaded, sheet_name=None, dtype=object)
+        xls = pd.ExcelFile(uploaded)
+
         cleaned = {}
-        for sh, df in sheets.items():
-            if df is None or getattr(df, "empty", True):
+        header_rows = {}
+
+        for sh in xls.sheet_names:
+            df_sh, header_row = read_excel_sheet_smart(uploaded, sh)
+            if df_sh is None or df_sh.empty:
                 continue
-            df = clean_df(df)
-            if not df.empty:
-                cleaned[str(sh).strip()] = df
-        return {"type": "excel", "sheets": cleaned}
+            cleaned[str(sh).strip()] = df_sh
+            header_rows[str(sh).strip()] = header_row
+
+        return {"type": "excel", "sheets": cleaned, "header_rows": header_rows}
 
     if name.endswith("json"):
         uploaded.seek(0)
@@ -205,6 +245,11 @@ if uploaded_files:
             # record encoding used (only for csv/tsv/txt)
             if result.get("encoding"):
                 z.writestr(f"{folder}/INFO_encoding.txt", f"Read using encoding: {result['encoding']}")
+
+            # record excel header row detection (helps debug weird templates)
+            if result.get("type") == "excel" and result.get("header_rows"):
+                rows_info = "\n".join([f"{sh}: header_row={hr}" for sh, hr in result["header_rows"].items()])
+                z.writestr(f"{folder}/INFO_excel_header_rows.txt", rows_info)
 
             # ===========================
             # CASE A: Excel with MULTIPLE SHEETS (each sheet = outlet)
@@ -249,6 +294,7 @@ if uploaded_files:
 
             # ===========================
             # CASE B: Outlet as COLUMNS (numeric outlet ids as headers)
+            # ✅ This now works for your screenshot format because Excel header row is detected correctly
             # ===========================
             outlet_cols = detect_outlet_columns(df)
             if outlet_cols:
@@ -279,7 +325,6 @@ if uploaded_files:
             # ===========================
             # CASE C: Outlet as ROWS (smart detection)
             # ===========================
-            # Prefer a combined key if both exist (Site no + Outlet ID)
             df2, combined_key = apply_combined_outlet_key_if_possible(df)
             if combined_key:
                 outlet_row_col = combined_key
